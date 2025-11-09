@@ -1,0 +1,10 @@
+name: maryland-dashboard
+title:
+username: c-tier
+account: c-tier
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16008373
+bundleId: 11151719
+url: https://c-tier.shinyapps.io/maryland-dashboard/
+version: 1

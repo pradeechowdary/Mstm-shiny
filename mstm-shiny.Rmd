@@ -1,0 +1,1295 @@
+---
+title: "Maryland Socioeconomic Trends Dashboard - Population, Households, and Employment (MSTM)"
+runtime: shiny
+author: ""
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: scroll
+    self_contained: true
+    social: menu
+    theme: sandstone
+---
+
+```{r setup, include=FALSE}
+# Load required packages
+library(flexdashboard)
+library(sf)
+library(dplyr)
+library(tidyr)
+library(leaflet)
+library(ggplot2)
+library(plotly)
+library(RColorBrewer)
+library(readxl)
+library(rlang)    # for dynamic column names
+
+# Turn off clutter
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(dplyr.summarise.inform = FALSE)
+knitr::opts_chunk$set(fig.height = 5, fig.width = 10)
+
+# --- Utility function for Indian-style comma formatting ---
+comma_format_indian <- function(x) {
+  format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+}
+
+
+# Clean, bold look for all charts
+theme_set(theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.title = element_text(size = 12),
+    panel.grid.minor = element_blank()
+  ))
+theme_update(
+  axis.title.x = element_text(size = 13, face = "bold", margin = margin(t = 10)),
+  axis.title.y = element_text(size = 13, face = "bold", margin = margin(r = 10)),
+  axis.text = element_text(size = 11)
+)
+options(plotly.layout.margin = list(l = 120, r = 60, t = 80, b = 80))
+
+# --- File paths ---
+base_path  <- "SE_Data"
+zones_path <- file.path(base_path, "Zones.shp")
+excel_path <- "Output_L2.xlsx"
+
+# --- Load preprocessed shapefile ---
+zones_poly <- readRDS("zones_ready.rds")
+
+# --- Compute area in square kilometers ---
+zones_poly <- zones_poly %>%
+  mutate(AREA_KM2 = as.numeric(st_area(geometry)) / 1e6)
+
+# --- Compute area in square kilometers for each zone ---
+zones_poly <- zones_poly %>%
+  mutate(AREA_KM2 = as.numeric(st_area(geometry)) / 1e6)
+
+
+
+# Simplify geometry to speed up rendering (fails gracefully on error)
+zones_poly <- tryCatch(
+  st_simplify(zones_poly, dTolerance = 200),
+  error = function(e) zones_poly
+)
+
+# Restrict to Maryland zones using available attributes
+if ("State" %in% names(zones_poly)) {
+  zones_poly <- zones_poly %>% filter(State == "Maryland")
+} else {
+  zones_poly <- zones_poly %>%
+    filter(grepl("MD", County) | grepl("Maryland", REGION, ignore.case = TRUE))
+}
+
+# Keep only valid polygons
+zones_poly <- zones_poly %>%
+  filter(st_geometry_type(.) %in% c("POLYGON", "MULTIPOLYGON")) %>%
+  st_make_valid()
+
+# Compute land area in square kilometers
+zones_poly$Area_km2 <- as.numeric(st_area(zones_poly)) / 1e6
+
+# Convert numeric fields in shapefile (base data)
+base_numeric <- c("POP", "HH", "Emp_Tot", "Emp_Ret", "Emp_Ind", "Emp_Off",
+                  "Emp_Edu", "Emp_Hea", "Emp_Foo", "Emp_Oth")
+zones_poly <- zones_poly %>%
+  mutate(across(all_of(base_numeric), ~ suppressWarnings(as.numeric(gsub(",", "", trimws(as.character(.x)))))))
+
+# Rename region codes to descriptive names
+zones_poly$REGION <- recode(zones_poly$REGION,
+  "SMZ_WEST"         = "Western Maryland",
+  "SMZ_MWCOG"        = "DC Metro Area",
+  "SMZ_EASTERN/PENN" = "Eastern Shore / PA Border",
+  "SMZ_EAST"         = "Central East",
+  "SMZ_DC"           = "Washington Corridor",
+  "SMZ_BMC"          = "Baltimore Metro",
+  "RMZ"              = "Rural Maryland",
+  "HALO_WV"          = "Halo WV",
+  "HALO_VA"          = "Halo VA",
+  "HALO_PENN"        = "Halo PA",
+  "HALO_PA"          = "Halo North PA",
+  "HALO_MWCOG VA"    = "Halo DC-VA"
+)
+
+# --- Load socioeconomic data from Excel ---
+mstm_data <- read_excel(excel_path)
+# Standardize column names for easier matching
+names(mstm_data) <- gsub("\\.", "_", names(mstm_data))
+
+```
+
+```{r}
+# 🧭 Year selector UI
+inputPanel(
+  selectInput(
+    "year_choice",
+    "Select Year:",
+    choices = c(2020, 2023, 2025, 2030, 2035, 2040, 2045, 2050),
+    selected = 2023
+  )
+)
+```
+
+```{r}
+zones_reactive <- reactive({
+  req(input$year_choice)
+  isolate({
+    # Convert actual year (e.g., 2023) into Excel suffix (e.g., "23")
+    year_suffix <- case_when(
+      input$year_choice == 2020 ~ "20",
+      input$year_choice == 2023 ~ "23",
+      input$year_choice == 2025 ~ "25",
+      input$year_choice == 2030 ~ "30",
+      input$year_choice == 2035 ~ "35",
+      input$year_choice == 2040 ~ "40",
+      input$year_choice == 2045 ~ "45",
+      input$year_choice == 2050 ~ "50",
+      TRUE ~ "23"
+    )
+
+    df <- zones_poly %>%
+      left_join(mstm_data, by = c("LVL_2_ID" = "L2_TAZ_MST")) %>%
+      mutate(
+        POP     = !!sym(paste0("HPOP_", year_suffix)),
+        HH      = !!sym(paste0("HH_",   year_suffix)),
+        Emp_Tot = !!sym(paste0("EMP_",  year_suffix)),
+        Emp_Ind = !!sym(paste0("IND_",  year_suffix)),
+        Emp_Ret = !!sym(paste0("RET_",  year_suffix)),
+        Emp_Off = !!sym(paste0("SER_",  year_suffix)),
+        Emp_Edu = !!sym(paste0("OTHED_", year_suffix)),
+        Emp_Hea = !!sym(paste0("OTHHSP_", year_suffix)),
+        Emp_Foo = !!sym(paste0("OTHFD_", year_suffix)),
+        Emp_Oth = !!sym(paste0("OTHOTH_", year_suffix))
+      ) %>%
+      mutate(
+        # Derived metrics
+        Emp_to_Pop_Ratio = ifelse(POP > 0, (Emp_Tot / POP) * 100, NA_real_),
+        Avg_HH_Size      = ifelse(HH > 0, POP / HH, NA_real_),
+        POP_Density      = ifelse(Area_km2 > 0, POP / Area_km2, NA_real_),
+        HH_Density       = ifelse(Area_km2 > 0, HH  / Area_km2, NA_real_),
+        EMP_Density      = ifelse(Area_km2 > 0, Emp_Tot / Area_km2, NA_real_)
+      )
+
+    return(df)
+  })
+})
+
+```
+
+# Population Patterns {.tabset}
+## Charts {.tabset}
+### Region Map 
+```{r, fig.height=5}
+renderLeaflet({
+  input$year_choice
+  zones_df <- zones_reactive()
+  zones_df$POP_SQRT <- sqrt(zones_df$POP)
+
+  pal_region <- colorNumeric(
+    palette = colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain  = zones_df$POP_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(zones_df, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap, group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron, group = "Light Mode") %>%
+    addPolygons(
+      data = zones_df %>% filter(!is.na(POP) & POP > 0),
+      fillColor   = ~pal_region(sqrt(POP)),
+      weight      = 0.4,
+      color       = "#444444",
+      fillOpacity = 0.6,
+      label       = ~sprintf(
+        "<b>County:</b> %s<br>\n<b>Region:</b> %s<br>\n<b>Total Population:</b> %s",
+        County, REGION, format(POP, big.mark = ",")
+      ) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(
+        weight = 2,
+        color = "#000000",
+        fillOpacity = 0.8,
+        bringToFront = TRUE
+      )
+    ) %>%
+    addLegend(
+      position = "bottomright",
+      pal      = pal_region,
+      values   = ~sqrt(POP),
+      title    = htmltools::HTML("<b>Population Intensity</b><br><span style='font-size:11px;'>Lighter = smaller population<br>Darker = denser zones</span>"),
+      opacity  = 0.85,
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+
+### County-Level Population Map {.tabset}
+```{r}
+renderLeaflet({
+  # Dissolve zones into counties and compute total population per county
+  input$year_choice
+  zones_df <- zones_reactive()
+
+  pop_by_county <- zones_df %>%
+    st_make_valid() %>%
+    group_by(County) %>%
+    summarise(Total_POP = sum(POP, na.rm = TRUE), .groups = "drop") %>%
+    st_union(by_feature = TRUE) %>%
+    st_buffer(0) %>%
+    st_as_sf()
+
+  # Palette for counties
+  pop_by_county$POP_SQRT <- sqrt(pop_by_county$Total_POP)
+  pal_county <- colorNumeric(
+    colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain = pop_by_county$POP_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(pop_by_county, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap,   group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron,    group = "Light Mode") %>%
+    addPolygons(
+      fillColor   = ~pal_county(POP_SQRT),
+      fillOpacity = 0.72,
+      color       = "#2b2b2b",
+      weight      = 1.1,
+      label       = ~sprintf("<b>%s County</b><br><b>Total Population:</b> %s",
+                             County, format(Total_POP, big.mark = ",")) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(weight = 2, color = "#000000", fillOpacity = 0.9, bringToFront = TRUE)
+    ) %>%
+    addLegend(
+      "bottomright", pal = pal_county, values = ~POP_SQRT, opacity = 0.85,
+      title = htmltools::HTML("<b>Total Population</b><br><span style='font-size:11px;'>Lighter = lower<br>Darker = higher</span>"),
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+
+## Row
+### Population and Employment Density by Region
+```{r}
+renderPlotly({
+  input$year_choice
+
+  density_region <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(
+      Pop_Density = sum(POP, na.rm = TRUE) / sum(AREA_KM2, na.rm = TRUE),
+      Emp_Density = sum(Emp_Tot, na.rm = TRUE) / sum(AREA_KM2, na.rm = TRUE)
+    ) %>%
+    pivot_longer(cols = c(Pop_Density, Emp_Density),
+                 names_to = "Type", values_to = "Density") %>%
+    mutate(Type = recode(Type,
+                         "Pop_Density" = "Population Density",
+                         "Emp_Density" = "Employment Density"))
+
+  p_density <- ggplot(density_region, aes(
+    x = reorder(REGION, Density),
+    y = Density,
+    fill = Type,
+    text = paste0(
+      "<b>Region:</b> ", REGION,
+      "<br><b>Type:</b> ", Type,
+      "<br><b>Density:</b> ", round(Density, 1), " per km²"
+    )
+  )) +
+    geom_col(position = "dodge", alpha = 0.9) +
+    coord_flip() +
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = paste0("Population & Employment Density by Region – ", input$year_choice),
+      subtitle = "Densities normalized by area (per km²)",
+      x = "Region",
+      y = "Density (per km²)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40")
+    )
+
+  ggplotly(p_density, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = paste0("<b>Population & Employment Density by Region – ", input$year_choice, "</b>"),
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Density (per km²)", font = list(size = 13)), tickformat = ",f"),
+      yaxis = list(title = list(text = "Region", font = list(size = 13)), autorange = "reversed"),
+      margin = list(l = 140, r = 50, t = 100, b = 100)
+    )
+})
+```
+
+
+## Row
+### Total Population & Household by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  pop_sum <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(
+      Total_POP = sum(POP, na.rm = TRUE),
+      Total_HH  = sum(HH,  na.rm = TRUE)
+    ) %>%
+    pivot_longer(
+      cols = c("Total_POP", "Total_HH"),
+      names_to = "Type",
+      values_to = "Value"
+    )
+  
+  # --- Force full comma formatting on ggplot axis ---
+  p_total <- ggplot(pop_sum, aes(x = REGION, y = Value, fill = Type)) +
+    geom_col(position = "dodge", alpha = 0.9) +
+    scale_y_continuous(
+      labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)
+    ) +   # ✅ Forces full comma format (no 1e+06)
+    labs(
+      title = "Total Population and Households by Region",
+      subtitle = "Aggregated totals better reflect Maryland’s regional distribution",
+      x = "Region",
+      y = "Total Value"
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  
+  # --- Ensure commas in Plotly display ---
+  ggplotly(p_total, tooltip = "text", height = 520) %>%
+    layout(
+      title = list(
+        text = "<b>Total Population and Household by Region</b><br><span style='font-size:12px;color:gray'>Total household and population values per Maryland region</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Region", font = list(size = 13))),
+      yaxis = list(
+        title = list(text = "Population", font = list(size = 13)),
+        tickformat = ",f"   # ✅ Forces full comma style in Plotly axis too
+      ),
+      margin = list(l = 160, r = 40, t = 90, b = 240)
+    )
+})
+
+```
+
+### Population by County
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  pop_county <- st_drop_geometry(zones_reactive()) %>%
+    group_by(County) %>%
+    summarise(Total_POP = sum(POP, na.rm = TRUE), .groups = "drop") %>%
+    filter(Total_POP > 0) %>%
+    arrange(desc(Total_POP))
+
+  p_pop_county <- ggplot(
+    pop_county %>% arrange(desc(Total_POP)),
+    aes(
+      x = reorder(County, Total_POP),
+      y = Total_POP,
+      fill = County,
+      text = paste(
+        "<b>County:</b>", County,
+        "<br><b>Total Population:</b>", format(Total_POP, big.mark = ",", scientific = FALSE)
+      )
+    )
+  ) +
+    geom_col(show.legend = FALSE, alpha = 0.9) +
+    coord_flip() +
+    scale_x_discrete(limits = rev(unique(pop_county$County))) +
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +  # ✅ format axis with commas
+    labs(
+      title = "Total Population by County",
+      subtitle = "Counties sorted in descending order (highest at top)",
+      x = "County",
+      y = "Total Population"
+    ) +
+    theme_minimal(base_size = 12)
+
+  # Render interactive plot
+  ggplotly(p_pop_county, tooltip = "text", height = 700) %>%
+    layout(
+      title = list(
+        text = "<b>Total Population by County</b><br><span style='font-size:12px;color:gray'>Highest population counties appear at the top</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(
+        title = list(text = "Total Population", font = list(size = 13)),
+        tickformat = ",f"   # ✅ comma format for population values
+      ),
+      yaxis = list(title = list(text = "County", font = list(size = 13))),
+      margin = list(l = 160, r = 40, t = 90, b = 340)
+    )
+})
+
+
+```
+
+## Row{.full}
+### Total Population by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  # Compute total population by region
+  df_pop_tot <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(Total_POP = sum(POP, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(Total_POP))
+
+  p_pop_tot <- ggplot(
+    df_pop_tot,
+    aes(
+      x = reorder(REGION, Total_POP),
+      y = Total_POP,
+      fill = REGION,
+      text = paste0(
+        "<b>Region:</b> ", REGION,
+        "<br><b>Total Population:</b> ", format(Total_POP, big.mark = ",", scientific = FALSE)
+      )
+    )
+  ) +
+    geom_col(alpha = 0.9, width = 0.55, show.legend = TRUE) +
+    coord_flip() +
+    # ✅ Force comma formatting for all y-axis values
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = "Total Population by Region",
+      subtitle = "",
+      x = "Region",
+      y = "Total Population"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.margin = margin(20, 40, 40, 100),
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
+      axis.title.x = element_text(size = 12, face = "bold", margin = margin(t = 15)),
+      axis.title.y = element_text(size = 12, face = "bold", margin = margin(r = 15))
+    )
+
+  # ✅ Render interactive plot with commas in Plotly axis
+  ggplotly(p_pop_tot, tooltip = "text", height = 550) %>%
+    layout(
+      title = list(
+        text = paste0(
+          "<b>Total Population by Region</b><br>",
+          "<span style='font-size:12px;color:gray'></span>"
+        ),
+        xanchor = "center",
+        x = 0.5
+      ),
+      xaxis = list(
+        title = list(text = "Total Population", font = list(size = 13)),
+        tickformat = ",f",   # ✅ Comma formatting
+        side = "bottom",
+        automargin = TRUE
+      ),
+      yaxis = list(
+        title = list(text = "Region", font = list(size = 13)),
+        automargin = TRUE,
+        anchor = "x"
+      ),
+      margin = list(l = 160, r = 60, t = 100, b = 150)
+    )
+})
+
+```
+
+## Row
+### Most Populated County in Each Region
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  # Identify the most populated county in each region
+  top_counties_region <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION, County) %>%
+    summarise(Total_POP = sum(POP, na.rm = TRUE), .groups = "drop") %>%
+    group_by(REGION) %>%
+    slice_max(order_by = Total_POP, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  p_top_counties_region <- ggplot(
+    top_counties_region,
+    aes(
+      x = reorder(REGION, Total_POP),
+      y = Total_POP,
+      fill = REGION,
+      text = paste0(
+        "<b>Region:</b> ", REGION,
+        "<br><b>Top County:</b> ", County,
+        "<br><b>Total Population:</b> ", format(Total_POP, big.mark = ",", scientific = FALSE)
+      )
+    )
+  ) +
+    geom_col(alpha = 0.9, width = 0.6) +
+    coord_flip() +
+    # ✅ Add comma formatting for numeric axis
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = paste0("Most Populated County in Each Maryland Region – ", input$year_choice),
+      subtitle = "Top county in each region based on total population",
+      x = "Region",
+      y = "Total Population"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
+      axis.text.y = element_text(face = "bold", size = 12)
+    )
+
+  # ✅ Interactive plot with comma tick formatting
+  ggplotly(p_top_counties_region, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = paste0(
+          "<b>Most Populated County in Each Maryland Region – ",
+          input$year_choice,
+          "</b><br><span style='font-size:12px;color:gray'>Top county in each region based on population</span>"
+        ),
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(
+        title = list(text = "Total Population", font = list(size = 13)),
+        tickformat = ",f"   # ✅ Full comma-based number formatting
+      ),
+      yaxis = list(title = list(text = "Region", font = list(size = 13))),
+      margin = list(l = 120, r = 40, t = 100, b = 100)
+    )
+})
+```
+
+
+# Household Dynamics {.tabset}
+
+## Charts {.tabset}
+### Household Map
+```{r, fig.height=5}
+renderLeaflet({
+  input$year_choice
+  # Prepare data for household map
+  zones_df <- zones_reactive()
+  zones_df$HH_SQRT <- sqrt(zones_df$HH)
+
+  pal_hh <- colorNumeric(
+    palette = colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain  = zones_df$HH_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(zones_df, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap, group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron, group = "Light Mode") %>%
+    addPolygons(
+      data = zones_df %>% filter(!is.na(HH) & HH > 0),
+      fillColor   = ~pal_hh(sqrt(HH)),
+      weight      = 0.4,
+      color       = "#444444",
+      fillOpacity = 0.6,
+      label       = ~sprintf(
+        "<b>Zone:</b> %s<br>\n<b>County:</b> %s<br>\n<b>Households:</b> %s",
+        GIS_Zone, County, format(HH, big.mark = ",")
+      ) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(
+        weight = 2,
+        color = "#000000",
+        fillOpacity = 0.8,
+        bringToFront = TRUE
+      )
+    ) %>%
+    addLegend(
+      position = "bottomright",
+      pal      = pal_hh,
+      values   = ~sqrt(HH),
+      title    = htmltools::HTML("<b>Total Households</b><br><span style='font-size:11px;'>Lighter = fewer households<br>Darker = denser zones</span>"),
+      opacity  = 0.85,
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+
+### County-Level Household Map
+```{r}
+### County-Level Household Map
+renderLeaflet({
+  input$year_choice
+  # Aggregate households by county
+  df <- zones_reactive()
+
+  hh_by_county <- df %>%
+    st_make_valid() %>%
+    group_by(County) %>%
+    summarise(Total_HH = sum(HH, na.rm = TRUE), .groups = "drop") %>%
+    st_union(by_feature = TRUE) %>%
+    st_buffer(0) %>%
+    st_as_sf()
+
+  # Palette for household counts
+  hh_by_county$HH_SQRT <- sqrt(hh_by_county$Total_HH)
+  pal_hh_county <- colorNumeric(
+    colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain = hh_by_county$HH_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(hh_by_county, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap,   group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron,    group = "Light Mode") %>%
+    addPolygons(
+      fillColor   = ~pal_hh_county(HH_SQRT),
+      fillOpacity = 0.72,
+      color       = "#2b2b2b",
+      weight      = 1.1,
+      label       = ~sprintf("<b>%s County</b><br><b>Total Households:</b> %s",
+                             County, format(Total_HH, big.mark = ",")) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(weight = 2, color = "#000000", fillOpacity = 0.9, bringToFront = TRUE)
+    ) %>%
+    addLegend(
+      "bottomright", pal = pal_hh_county, values = ~HH_SQRT, opacity = 0.85,
+      title = htmltools::HTML("<b>Total Households</b><br><span style='font-size:11px;'>Lighter = lower<br>Darker = higher</span>"),
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+
+## Row
+### Average Household Density by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  # Compute average household density per region
+  avg_hh_density <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(Mean_HH_Density = mean(HH_Density, na.rm = TRUE)) %>%
+    arrange(desc(Mean_HH_Density))
+
+  p_hh_density <- ggplot(avg_hh_density, aes(
+    x = reorder(REGION, Mean_HH_Density),
+    y = Mean_HH_Density,
+    fill = REGION,
+    text = paste("Region:", REGION, "<br>Avg. Household Density:", round(Mean_HH_Density, 1), "per km²")
+  )) +
+    geom_col(width = 0.7) +
+    coord_flip() +
+    labs(
+      title = "Average Household Density by Region",
+      subtitle = "Each value shows average number of households per square kilometer",
+      x = "Region",
+      y = "Avg. Households per km²"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30")
+    ) +
+    guides(fill = "none")
+
+  # Render interactive plot
+  ggplotly(p_hh_density, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = "<b>Average Household Density by Region</b><br><span style='font-size:12px;color:gray'>Avg. households per km²</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Avg. Households per km²", font = list(size = 13))),
+      yaxis = list(title = list(text = "Region", font = list(size = 13)), autorange = "reversed"),
+      margin = list(l = 120, r = 40, t = 90, b = 80)
+    )
+})
+
+```
+
+## Row
+### Average Households by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  # Compute average number of households per zone in each region
+  avg_hh <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(Mean_HH = mean(HH, na.rm = TRUE)) %>%
+    arrange(desc(Mean_HH))
+
+  p_avg_hh <- ggplot(avg_hh, aes(
+    x = reorder(REGION, Mean_HH),
+    y = Mean_HH,
+    fill = REGION,
+    text = paste(
+      "<b>Region:</b>", REGION,
+      "<br><b>Avg. Households per Zone:</b>", scales::comma(round(Mean_HH, 0))
+    )
+  )) +
+    geom_col(alpha = 0.9) +
+    coord_flip() +
+    labs(
+      title = "Average Household Size by Region",
+      subtitle = "Represents the average number of households per planning zone",
+      x = "Region",
+      y = "Avg. Households per Zone"
+    ) +
+    guides(fill = "none") +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+      axis.title.y = element_text(size = 13),
+      axis.title.x = element_text(size = 13)
+    )
+
+  # Render interactive plot
+  ggplotly(p_avg_hh, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = "<b>Average Household Size by Region</b><br><span style='font-size:12px;color:gray'>Each value represents the mean number of households per zone within a region</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Avg. Households per Zone", font = list(size = 13))),
+      yaxis = list(title = list(text = "Region", font = list(size = 13)), autorange = "reversed"),
+      margin = list(l = 120, r = 40, t = 90, b = 80)
+    )
+})
+
+```
+
+## Row{.full}
+### Frequency of Household Size Groups
+```{r}
+renderPlotly({
+  input$year_choice
+  # Categorise zones by average household size into groups
+  zone_df <- st_drop_geometry(zones_reactive()) %>%
+    mutate(HHSIZE_group = case_when(
+      Avg_HH_Size <= 1.5 ~ "1",
+      Avg_HH_Size <= 2.5 ~ "2",
+      Avg_HH_Size <= 3.5 ~ "3",
+      Avg_HH_Size <= 4.5 ~ "4",
+      Avg_HH_Size <= 5.5 ~ "5",
+      TRUE               ~ "6"
+    ))
+
+  # Define colours and labels for each group
+  hh_colors <- c(
+    "1" = "#1f77b4",  # Single / Very Small
+    "2" = "#ff7f0e",  # Small
+    "3" = "#2ca02c",  # Medium
+    "4" = "#d62728",  # Large
+    "5" = "#9467bd",  # Very Large
+    "6" = "#8c564b"   # Extended
+  )
+
+  hh_labels <- c(
+    "1" = "Single / Very Small (0–1.5 people)",
+    "2" = "Small (1.5–2.5 people)",
+    "3" = "Medium (2.5–3.5 people)",
+    "4" = "Large (3.5–4.5 people)",
+    "5" = "Very Large (4.5–5.5 people)",
+    "6" = "Extended (5.5+ people)"
+  )
+
+  # Plot grouped frequencies
+  p_hh_group <- ggplot(zone_df, aes(x = HHSIZE_group, fill = HHSIZE_group)) +
+    geom_bar(color = "black", alpha = 0.9) +
+    scale_fill_manual(values = hh_colors, name = "Household Size Group", labels = hh_labels) +
+    labs(
+      title = "Frequency of Household Size Groups",
+      subtitle = "Number of Maryland planning zones within each average household size range",
+      x = "Average Household Size Group",
+      y = "Number of Zones"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+      axis.text.x = element_text(size = 11),
+      legend.position = "right"
+    )
+
+  # Render interactive plot
+  ggplotly(p_hh_group, tooltip = c("x", "y")) %>%
+    layout(
+      title = list(
+        text = "<b>Frequency of Household Size Groups</b><br><span style='font-size:12px;color:gray'></span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Average Household Size Group", font = list(size = 13))),
+      yaxis = list(title = list(text = "Number of Zones", font = list(size = 13))),
+      margin = list(l = 90, r = 40, t = 100, b = 90)
+    )
+})
+
+```
+
+### Household Count Distribution
+```{r}
+renderPlotly({
+  input$year_choice
+  # Plot distribution of household counts per zone
+  p_hh_density <- ggplot(st_drop_geometry(zones_reactive()), aes(x = HH)) +
+    geom_density(fill = "steelblue", alpha = 0.4) +
+    geom_histogram(aes(y = after_stat(density)), binwidth = 100, fill = "orange", color = "black", alpha = 0.5) +
+    labs(
+      title = "Household Count Distribution",
+      subtitle = "Shows the spread and concentration of household counts across all Maryland zones",
+      x = "Households per Zone",
+      y = "Density"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30")
+    )
+
+  # Render interactive plot
+  ggplotly(p_hh_density, tooltip = "x") %>%
+    layout(
+      title = list(
+        text = "<b>Household Count Distribution</b><br><span style='font-size:12px;color:gray'>Distribution of household counts across all zones</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Number of Households", font = list(size = 13)), tickformat = ","),
+      yaxis = list(title = list(text = "Density", font = list(size = 13))),
+      margin = list(l = 100, r = 50, t = 90, b = 100)
+    )
+})
+
+```
+
+# Employment Structure {.tabset}
+
+## Charts {.tabset}
+### Employment Map
+```{r, fig.height=5}
+renderLeaflet({
+  input$year_choice
+  # Prepare data for employment map
+  zones_df <- zones_reactive()
+  zones_df$EMP_SQRT <- sqrt(zones_df$Emp_Tot)
+
+  pal_emp <- colorNumeric(
+    palette = colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain  = zones_df$EMP_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(zones_df, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap, group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron, group = "Light Mode") %>%
+    addPolygons(
+      data = zones_df %>% filter(!is.na(Emp_Tot) & Emp_Tot > 0),
+      fillColor   = ~pal_emp(sqrt(Emp_Tot)),
+      weight      = 0.4,
+      color       = "#444444",
+      fillOpacity = 0.6,
+      label       = ~sprintf(
+        "<b>Zone:</b> %s<br>\n<b>County:</b> %s<br>\n<b>Total Employment:</b> %s",
+        GIS_Zone, County, format(Emp_Tot, big.mark = ",")
+      ) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(
+        weight = 2,
+        color = "#000000",
+        fillOpacity = 0.8,
+        bringToFront = TRUE
+      )
+    ) %>%
+    addLegend(
+      position = "bottomright",
+      pal      = pal_emp,
+      values   = ~sqrt(Emp_Tot),
+      title    = htmltools::HTML("<b>Total Employment</b><br><span style='font-size:11px;'>Lighter = fewer jobs<br>Darker = more concentrated employment</span>"),
+      opacity  = 0.85,
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+
+### County-Level Employment Map
+```{r}
+renderLeaflet({
+  input$year_choice
+  # Aggregate total employment by county
+  zones_df <- zones_reactive()
+
+  emp_by_county <- zones_df %>%
+    st_make_valid() %>%
+    group_by(County) %>%
+    summarise(Total_EMP = sum(Emp_Tot, na.rm = TRUE), .groups = "drop") %>%
+    st_union(by_feature = TRUE) %>%
+    st_buffer(0) %>%
+    st_as_sf()
+
+  # Palette for employment counts
+  emp_by_county$EMP_SQRT <- sqrt(emp_by_county$Total_EMP)
+  pal_emp_county <- colorNumeric(
+    colorRampPalette(c("#fff5f0", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"))(8),
+    domain = emp_by_county$EMP_SQRT,
+    na.color = "transparent"
+  )
+
+  leaflet(emp_by_county, options = leafletOptions(minZoom = 6, zoomControl = TRUE)) %>%
+    addProviderTiles(providers$Esri.WorldTopoMap,   group = "Topographic (City Labels)") %>%
+    addProviderTiles(providers$Esri.WorldStreetMap, group = "Street View") %>%
+    addProviderTiles(providers$CartoDB.Positron,    group = "Light Mode") %>%
+    addPolygons(
+      fillColor   = ~pal_emp_county(EMP_SQRT),
+      fillOpacity = 0.72,
+      color       = "#2b2b2b",
+      weight      = 1.1,
+      label       = ~sprintf("<b>%s County</b><br><b>Total Employment:</b> %s",
+                             County, format(Total_EMP, big.mark = ",")) %>% lapply(htmltools::HTML),
+      highlightOptions = highlightOptions(weight = 2, color = "#000000", fillOpacity = 0.9, bringToFront = TRUE)
+    ) %>%
+    addLegend(
+      "bottomright", pal = pal_emp_county, values = ~EMP_SQRT, opacity = 0.85,
+      title = htmltools::HTML("<b>Total Employment</b><br><span style='font-size:11px;'>Lighter = lower<br>Darker = higher</span>"),
+      labFormat = labelFormat(big.mark = ",")
+    ) %>%
+    addLayersControl(
+      baseGroups = c("Topographic (City Labels)", "Street View", "Light Mode"),
+      options = layersControlOptions(collapsed = FALSE)
+    ) %>%
+    setView(lng = -76.7, lat = 39.0, zoom = 8)
+})
+
+```
+## Row
+### Employment Density by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  emp_density_region <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(
+      Emp_Density = sum(Emp_Tot, na.rm = TRUE) / sum(AREA_KM2, na.rm = TRUE)
+    ) %>%
+    arrange(desc(Emp_Density))
+  
+  p_emp_density <- ggplot(emp_density_region, aes(
+    x = reorder(REGION, Emp_Density),
+    y = Emp_Density,
+    fill = REGION,
+    text = paste(
+      "<b>Region:</b>", REGION,
+      "<br><b>Employment Density:</b>", round(Emp_Density, 1), "jobs per km²"
+    )
+  )) +
+    geom_col(width = 0.7, alpha = 0.9) +
+    coord_flip() +
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = "Employment Density by Region",
+      subtitle = "Average number of jobs per square kilometer",
+      x = "Region",
+      y = "Employment Density (jobs per km²)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40")
+    ) +
+    guides(fill = "none")
+  
+  ggplotly(p_emp_density, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = "<b>Employment Density by Region</b><br><span style='font-size:12px;color:gray'>Jobs per km²</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Employment Density (jobs per km²)", font = list(size = 13)), tickformat = ",f"),
+      yaxis = list(title = list(text = "Region", font = list(size = 13)), autorange = "reversed"),
+      margin = list(l = 140, r = 50, t = 100, b = 100)
+    )
+})
+```
+
+## Row {.full}
+### Employment by Sector and Region
+```{r}
+renderPlotly({
+  input$year_choice
+  # Define sector columns and friendly labels
+  sector_cols <- c("Emp_Ret", "Emp_Off", "Emp_Ind", "Emp_Edu", "Emp_Hea", "Emp_Foo", "Emp_Oth")
+  sector_labels <- c(
+    "Emp_Edu" = "Education",
+    "Emp_Foo" = "Food & Accommodation",
+    "Emp_Hea" = "Healthcare",
+    "Emp_Ind" = "Industrial / Manufacturing",
+    "Emp_Off" = "Office / Professional Services",
+    "Emp_Oth" = "Other Services",
+    "Emp_Ret" = "Retail Trade"
+  )
+
+  # Summarise employment by sector and region
+  emp_long <- st_drop_geometry(zones_reactive()) %>%
+    select(REGION, all_of(sector_cols)) %>%
+    pivot_longer(cols = all_of(sector_cols), names_to = "Sector", values_to = "Employees") %>%
+    mutate(Sector = recode(Sector, !!!sector_labels)) %>%
+    group_by(REGION, Sector) %>%
+    summarise(Employees = sum(Employees, na.rm = TRUE), .groups = "drop")
+
+  # Create stacked bar chart
+  p_emp_sector <- ggplot(emp_long, aes(x = Sector, y = Employees, fill = REGION)) +
+    geom_col(position = "stack", width = 0.8) +
+    labs(
+      title = "Employment by Sector and Region",
+      subtitle = "",
+      x = "Employment Sector",
+      y = "Number of Employees"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 16),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
+      axis.text.x = element_text(angle = 25, vjust = 1, hjust = 1, size = 11, face = "bold")
+    )
+
+  # Render interactive plot
+  ggplotly(p_emp_sector) %>%
+    layout(
+      title = list(
+        text = "<b>Employment by Sector and Region</b><br><span style='font-size:12px;color:gray'>Total employees by sector across all regions</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Employment Sector", font = list(size = 13))),
+      yaxis = list(title = list(text = "Number of Employees", font = list(size = 13)), tickformat = ","),
+      margin = list(l = 80, r = 50, t = 90, b = 100)
+    )
+})
+
+```
+
+## Row
+### Total Employment by Region
+```{r}
+renderPlotly({
+  input$year_choice
+
+  # Compute total employment by region
+  emp_by_region <- st_drop_geometry(zones_reactive()) %>%
+    group_by(REGION) %>%
+    summarise(Total_Emp = sum(Emp_Tot, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(Total_Emp))
+
+  p_emp_tot <- ggplot(
+    emp_by_region,
+    aes(
+      x = Total_Emp,
+      y = reorder(REGION, Total_Emp),
+      fill = REGION,
+      text = paste0(
+        "<b>Region:</b> ", REGION,
+        "<br><b>Total Employment:</b> ", format(Total_Emp, big.mark = ",", scientific = FALSE)
+      )
+    )
+  ) +
+    geom_col(alpha = 0.9, width = 0.6, show.legend = TRUE) +
+    # ✅ Format axis numbers with commas
+    scale_x_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = "Total Employment by Region",
+      subtitle = "",
+      x = "Total Employment",
+      y = NULL
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30"),
+      axis.text.y = element_text(size = 12, face = "bold", hjust = 1, margin = margin(r = 10)),
+      axis.text.x = element_text(size = 11),
+      legend.position = "right",
+      legend.title = element_text(size = 12, face = "bold"),
+      legend.text = element_text(size = 11),
+      plot.margin = margin(t = 20, r = 40, b = 80, l = 180)
+    )
+
+  # ✅ Render interactive plot with comma format on axis ticks
+  ggplotly(p_emp_tot, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = "<b>Total Employment by Region</b><br><span style='font-size:12px;color:gray'>Regional employment totals</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(
+        title = list(text = "Total Employment", font = list(size = 13)),
+        tickformat = ",f"  # ✅ comma-formatted values (e.g., 1,000,000)
+      ),
+      yaxis = list(
+        title = list(text = ""),
+        automargin = TRUE
+      ),
+      margin = list(l = 160, r = 40, t = 90, b = 80)
+    )
+})
+
+```
+
+## Row
+### Employment-to-Population Ratio by Region
+```{r}
+renderPlotly({
+  input$year_choice
+  # Compute average employment-to-population ratio by region
+  emp_ratio_region <- st_drop_geometry(zones_reactive()) %>%
+    mutate(Emp_to_Pop_Ratio_Clean = Emp_to_Pop_Ratio / 10) %>%
+    group_by(REGION) %>%
+    summarise(Avg_Ratio = mean(Emp_to_Pop_Ratio_Clean, na.rm = TRUE)) %>%
+    arrange(desc(Avg_Ratio))
+
+  p_emp_ratio <- ggplot(emp_ratio_region, aes(
+    x = reorder(REGION, Avg_Ratio),
+    y = Avg_Ratio,
+    fill = REGION,
+    text = paste0(
+      "<b>Region:</b> ", REGION,
+      "<br><b>Employment-to-Population Ratio:</b> ", round(Avg_Ratio, 1), "%"
+    )
+  )) +
+    geom_col(alpha = 0.9, width = 0.6, show.legend = FALSE) +
+    coord_flip() +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title = "Employment-to-Population Ratio by Region",
+      subtitle = "Share of residents engaged in employment (%)",
+      x = "Region",
+      y = "Employment-to-Population Ratio (%)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray40"),
+      axis.text.y = element_text(size = 12, face = "bold", hjust = 1, margin = margin(r = 10)),
+      axis.text.x = element_text(size = 11)
+    )
+
+  # Render interactive plot
+  ggplotly(p_emp_ratio, tooltip = "text") %>%
+    layout(
+      title = list(
+        text = "<b>Employment-to-Population Ratio by Region</b><br><span style='font-size:12px;color:gray'>Average share of working residents per region</span>",
+        xanchor = "center", x = 0.5
+      ),
+      xaxis = list(title = list(text = "Employment-to-Population Ratio (%)", font = list(size = 13))),
+      yaxis = list(title = list(text = "Region", font = list(size = 13)), autorange = "reversed"),
+      margin = list(l = 140, r = 40, t = 100, b = 120)
+    )
+})
+
+```
+
+## Row
+### Employment by Sector (Total)
+```{r}
+renderPlotly({
+  input$year_choice
+  
+  # Summarise employment totals across all sectors
+  sector_cols <- c("Emp_Ret", "Emp_Off", "Emp_Ind", "Emp_Edu", "Emp_Hea", "Emp_Foo", "Emp_Oth")
+
+  emp_sector_tot <- st_drop_geometry(zones_reactive()) %>%
+    summarise(across(all_of(sector_cols), ~ sum(.x, na.rm = TRUE))) %>%
+    pivot_longer(everything(), names_to = "Sector", values_to = "Total_Employees") %>%
+    mutate(Sector = gsub("Emp_", "", Sector))
+
+  # Replace abbreviated sector names with human-readable labels
+  emp_sector_tot <- emp_sector_tot %>%
+    mutate(Sector = recode(Sector,
+      "Edu" = "Education",
+      "Foo" = "Food & Accommodation",
+      "Hea" = "Healthcare",
+      "Ind" = "Industrial / Manufacturing",
+      "Off" = "Office / Professional Services",
+      "Oth" = "Other Services",
+      "Ret" = "Retail Trade",
+      "to_Pop_Ratio" = "Employment-to-Population Ratio"
+    ))
+
+  # Build chart
+  p_emp_sector_tot <- ggplot(
+    emp_sector_tot,
+    aes(
+      x = reorder(Sector, Total_Employees),
+      y = Total_Employees,
+      fill = Sector,
+      text = paste0(
+        "<b>Sector:</b> ", Sector,
+        "<br><b>Total Employment:</b> ", format(Total_Employees, big.mark = ",", scientific = FALSE)
+      )
+    )
+  ) +
+    geom_col(show.legend = FALSE, alpha = 0.9) +
+    coord_flip() +
+    # ✅ Add comma formatting to numeric axis
+    scale_y_continuous(labels = function(x) format(round(x, 0), big.mark = ",", scientific = FALSE)) +
+    labs(
+      title = "Employment by Sector",
+      subtitle = "",
+      x = "Employment Sector",
+      y = "Total Employees"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray30")
+    )
+
+  # Render interactive plot if data exists
+  if (nrow(emp_sector_tot) > 0) {
+    ggplotly(p_emp_sector_tot, tooltip = "text") %>%
+      layout(
+        title = list(
+          text = "<b>Employment by Sector</b><br><span style='font-size:12px;color:gray'>Total employees across all sectors</span>",
+          xanchor = "center", x = 0.5
+        ),
+        # ✅ comma-formatted x-axis ticks
+        xaxis = list(
+          title = list(text = "Total Employees", font = list(size = 13)),
+          tickformat = ",f"
+        ),
+        yaxis = list(title = list(text = "Employment Sector", font = list(size = 13))),
+        margin = list(l = 140, r = 50, t = 100, b = 100)
+      )
+  }
+})
+
+```

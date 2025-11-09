@@ -1,0 +1,10 @@
+name: mstm-shiny
+title:
+username: c-tier
+account: c-tier
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16008362
+bundleId: 11151395
+url: https://c-tier.shinyapps.io/mstm-shiny/
+version: 1
