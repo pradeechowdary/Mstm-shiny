@@ -55,7 +55,22 @@ zones_path <- file.path(base_path, "Zones.shp")
 excel_path <- "Output_L2.xlsx"
 
 # --- Load preprocessed shapefile ---
-zones_poly <- readRDS("zones_ready.rds")
+message("📂 Checking for zones_ready.rds...")
+if (file.exists("zones_ready.rds")) {
+  message("✅ zones_ready.rds found, loading...")
+  zones_poly <- readRDS("zones_ready.rds")
+} else {
+  stop("❌ zones_ready.rds NOT FOUND in working directory")
+}
+
+message("📂 Checking for Excel file...")
+if (file.exists("Output_L2.xlsx")) {
+  message("✅ Excel file found, loading...")
+  mstm_data <- readxl::read_excel("Output_L2.xlsx")
+} else {
+  stop("❌ Excel file missing: Output_L2.xlsx")
+}
+
 
 # --- Compute area in square kilometers ---
 zones_poly <- zones_poly %>%
